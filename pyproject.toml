@@ -1,0 +1,20 @@
+[build-system]
+    requires = ["setuptools"]
+    build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+    PyZwoCapture = ["ASICamera2.dll", "ASICamera2.lib"]
+
+[tool.setuptools.dynamic]
+    version = {attr = "PyZwoCapture.CameraCapture.__version__"}
+
+
+[project]
+    name = "PyZwoCapture"
+    keywords = ["Zwo", "ASI", "flash-tag", "IOTAflash"]
+    dynamic = ["version"]
+    description = "For ZWO ASI cameras: controls, captures, and runs the IOTAflash module"
+    authors = [
+        {name = "Robert L Anderson, Jr", email = "bob.anderson.ok@gmail.com"}
+    ]
+    readme = "README.rst"
