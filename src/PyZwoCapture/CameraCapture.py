@@ -8,7 +8,7 @@
 #
 # =============================================================================
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import gc
 import glob
@@ -20,17 +20,12 @@ import serial.serialwin32 as win_serial
 
 import matplotlib
 from astropy.io import fits
-# from matplotlib.pyplot import Figure
+from matplotlib.pyplot import Figure
 # import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as FigureCanvas
 
 matplotlib.use('TkAgg')
 
-# from matplotlib.figure import Figure
-# from matplotlib.backends.backend_tkagg import (
-#     FigureCanvasTkAgg,
-# NavigationToolbar2Tk
-# )
 
 import psutil
 import tkinter
@@ -280,8 +275,11 @@ canvasFrame = None  # Used in zooming the image
 imageZoomScroller = None
 pixelValueLabel = None
 
+currentFrameNum = 0
+
 histogramStack = []
 
+# arduinoPort = serial.Serial()
 arduinoPort = None
 
 frameNumber = 0
@@ -331,15 +329,18 @@ GLOBAL['guiCmdQueue'] = Queue()
 GLOBAL['displayQueue'] = Queue()
 GLOBAL['camCmdQueue'] = Queue()
 GLOBAL['camReaderQueue'] = Queue()
+GLOBAL['serialOutQueue'] = Queue()
 
 timestampList = []  # Used for debugging only
 
 GLOBAL['fileWritingInProgress'] = Value('i', False)
+GLOBAL['earlyTerminationRequested'] = Value('i', False)
 GLOBAL['cameraIsRunning'] = Value('i', False)
 GLOBAL['numFramesToRecord'] = Value('i', 0)
 GLOBAL['numFramesWritten'] = Value('i', 0)
 GLOBAL['framesAcquired'] = Value('i', 0)
 GLOBAL['UTCstartArmed'] = Value('i', False)
+GLOBAL['waitForRestart'] = Value('i', False)
 
 saveFolderRoot = ''
 fitsFolderPath = ''
@@ -541,19 +542,39 @@ def writeFilesThread():
             # write the fits file
             outlist.writeto(filepath, overwrite=True)
 
+            if GLOBAL['earlyTerminationRequested'].value and not GLOBAL['waitForRestart'].value:
+                showInfo('files written report',
+                         f"Early termination requested honored:\n\n"
+                         f"\t{GLOBAL['numFramesWritten'].value} were written.\n\n")
+                GLOBAL['waitForRestart'].value = True
+                fileProgressBar['value'] = 0
+
             if frame >= GLOBAL['numFramesToRecord'].value - 1 + FLASH_FRAMES:  # This the termination test
                 fileProgressBar['value'] = 0
-                showInfo('File write status',
-                         f"\n@ frame: {frame+1} ... all RAM images have been written to files.\n\n\n\n")
-                GLOBAL['numFramesWritten'].value = 0
-                processFlashLightCurve()
-                flashLightCurve = []  # Reset the list to empty, ready for the next capture.
+                if not GLOBAL['waitForRestart'].value:
+                    processFlashLightCurve()
+                    flashLightCurve = []  # Reset the list to empty, ready for the next capture.
+                    initalizeForNewRecording()
 
         else:
             time.sleep(0.1)
 
+
+def initalizeForNewRecording():
+    global fileProgressBar
+
+    GLOBAL['earlyTerminationRequested'].value = False
+    GLOBAL['numFramesWritten'].value = 0
+    GLOBAL["numFramesToRecord"].value = 0
+    GLOBAL['fileWritingInProgress'].value = False
+    GLOBAL['framesAcquired'].value = 0
+    GLOBAL['waitForRestart'].value = False
+    fileProgressBar['value'] = 0
+
 def processFlashLightCurve(ts1='2023-11-11 16:29:20+00:00', ts2='2023-11-11 16:29:21+00:00'):
     global flashLightCurve, fitsFolderPath
+
+    plotFlashLightCurve()
 
     DOC_ON = True
 
@@ -762,7 +783,52 @@ def processFlashLightCurve(ts1='2023-11-11 16:29:20+00:00', ts2='2023-11-11 16:2
         deltas = []
         for i in range(1, len(cpu_frame_times)):
             deltas.append((cpu_frame_times[i] - cpu_frame_times[i-1]).total_seconds())
-        print(f"avg delta: {np.mean(deltas):0.6f}  median delta: {np.median(deltas)}  max delta: {np.max(deltas)}  min delta: {np.min(deltas)}")
+        # Now we look for unusual gaps
+        median_gap = np.median(deltas)
+        msg = [
+            f"avg delta: {np.mean(deltas):0.6f}  median delta: {np.median(deltas)}  "
+            f"max delta: {np.max(deltas)}  min delta: {np.min(deltas)}\n\n"
+        ]
+        print(msg[0])
+        for i, delta in enumerate(deltas):
+            if delta > 1.5 * median_gap:
+                msg.append(f"At frame {i} there is a gap that is {delta/median_gap:0.1f} times normal.\n\n")
+        if len(msg) == 1:
+            msg.append(f"Gap analysis of cpu timestamps indicate that there were no dropped frames.\n\n")
+        show_scrollable_list(width=1000, height=300, lines=msg, title='Dropped frame detection report:')
+
+
+def plotFlashLightCurve():
+    global lastROIinputString, flashLightCurve, flashOnCmdString, cameraState
+
+    parent = tk.Toplevel()
+
+    # The pylab figure manager will be bypassed in this instance.
+    # This means that `fig` will be garbage collected as you'd expect.
+    fig = Figure(figsize=(10, 5))
+    _ = FigureCanvas(fig)
+    axes = fig.add_subplot(111)
+
+    if lastROIinputString == '':
+        lastROIinputString = f"{cameraState['currentImageWidth']} x {cameraState['currentImageHeight']}"
+    two_line_title = f"Flash LightCurve for {cameraState['cameraName']} @ " \
+                       f"gain: {cameraState['gain'][0]} "\
+          f"exposure: {cameraState['exposure'][0] / 1000:0.3f} ms  gamma: {cameraState['gamma']}\n" \
+          f"ROI: {lastROIinputString}  Flash command: {flashOnCmdString}"
+    axes.set_title(two_line_title)
+    axes.grid(axis='x')
+    axes.plot(flashLightCurve, '-', color='lightgray')
+    axes.plot(flashLightCurve, '.')
+    axes.set_xlabel('reading number')
+    axes.set_ylabel('intensity')
+
+    # creating the Tkinter canvas
+    # containing the Matplotlib figure
+    local_canvas = FigureCanvas(fig, master=parent)
+    local_canvas.draw()
+
+    # Place the canvas on the Tkinter window
+    local_canvas.get_tk_widget().pack()
 
 def getFormattedSettings():
     global cameraState, avgFrameTime
@@ -875,7 +941,7 @@ def connectToArduino(port):
             # stopbits=serial.serialutil.STOPBITS_ONE,
             stopbits=1,
             rtscts=True,
-            write_timeout=0.5  # seconds
+            write_timeout=0  # seconds
         )
     except win_serial.SerialException as e:  # noqa
         showInfo('Arduino error',f"{e}")
@@ -890,6 +956,47 @@ def connectToArduino(port):
     )
     time.sleep(2)
     my_dialog.destroy()
+
+def testSerialIO():
+
+    msg_num = 0
+    time.sleep(4)  # Give enough time for the serialRcvThread() to detect arduinoPort
+
+    while True:
+        time.sleep(.05)
+
+        # msg_num += 1
+        # test_echo = f"echo(bobs-test-------------------------------------------------------------{msg_num})\n"
+        # GLOBAL['serialOutQueue'].put(test_echo)
+
+def serialOutThread():
+    global arduinoPort
+
+    while arduinoPort is None:
+        time.sleep(0.1)
+
+    arduinoPort.flush()  # noqa
+
+    while True:
+        try:
+            str_to_send = GLOBAL['serialOutQueue'].get()
+            arduinoPort.write(bytes(str_to_send, encoding='ascii'))  # noqa (didn't like None for initial value)
+        except (BrokenPipeError, EOFError, OSError):  # These exceptions are thrown during shutdown - we ignore them
+            pass
+
+def serialRcvThread():
+    global arduinoPort
+
+    while arduinoPort is None:
+        time.sleep(0.1)
+
+    arduinoPort.flush()  # noqa
+
+    while True:
+        if arduinoPort.in_waiting > 0:       # noqa
+            buffer = arduinoPort.readline()  # noqa
+            rcvd_str = buffer.decode('ascii')
+            print(f"SerialIn: {rcvd_str[:-1]}")
 
 def guiCmdHandler():
     global leapSeconds
@@ -929,7 +1036,7 @@ def guiCmdHandler():
 
 
             cameraControlInfo = cmd[1]
-            if DEV_MODE or True:  # TODO Remove this 'always print cameraControlInfo' override
+            if DEV_MODE:  # TODO add 'or True' to this test to always print cameraControlInfo
                 lines = []
                 for cn in sorted(cmd[1].keys()):
                     print(f'    {cn}:')
@@ -1079,14 +1186,6 @@ def camCaptureProc(GLOBAL):  # noqa (GLOBAL shadows)
 
         camera = asi.Camera(camera_id)
 
-    # TODO Remove this exploratory code
-    print(f"asi.ASI_HIGH_SPEED_MODE: {asi.ASI_HIGH_SPEED_MODE}")
-    control_value = camera.get_control_value(asi.ASI_HIGH_SPEED_MODE)
-    print(f"high speed mode value: {control_value}")
-    num_controls = camera.get_num_controls()
-    print(f"num_controls: {num_controls}")
-    # camera.set_control_value(asi.ASI_HIGH_SPEED_MODE, 1)  # This breaks the ASI432 - no video It doesn't have that control
-
     controls = camera.get_controls()
 
     GLOBAL['guiCmdQueue'].put(['saveControlInfo', controls])  # This will also turn on video
@@ -1153,7 +1252,7 @@ def camCaptureProc(GLOBAL):  # noqa (GLOBAL shadows)
                 GLOBAL['UTCstartArmed'].value = False
                 GLOBAL['guiCmdQueue'].put(['utcButtonGreen'])
 
-        if sendImagesToTheWriteQueue:  # We are writing images to disk
+        if sendImagesToTheWriteQueue:  # We are to send images to the writeFilesThread() through the imageWriteQueue
             if currentWriteFrame == 0:  # We are just starting - this is the first image to be written
                 GLOBAL['guiCmdQueue'].put(['disableButtons'])
                 firstFrameID = frameNumber  # We need firstFrameID to be able to calculate a frame number that is 'write' relative
@@ -1172,10 +1271,15 @@ def camCaptureProc(GLOBAL):  # noqa (GLOBAL shadows)
 
             GLOBAL['imageWriteQueue'].put([frameNumber - firstFrameID, droppedFrames, image, time.perf_counter_ns(),  # noqa
                                            avgFrameTime, datetime.datetime.utcnow()])
+            # print("camProc sent an image to imageWriteQueue")
             currentWriteFrame += 1
             # GLOBAL['numFramesWritten'].value = frameNumber - firstFrameID
-            if currentWriteFrame >= GLOBAL['numFramesToRecord'].value + FLASH_FRAMES:
-                print(f"camProc finished because numFramesToRecord: {GLOBAL['numFramesToRecord'].value}")
+
+            if currentWriteFrame >= GLOBAL['numFramesToRecord'].value + FLASH_FRAMES or GLOBAL['earlyTerminationRequested'].value:
+                if GLOBAL['earlyTerminationRequested'].value:
+                    print(f"Stopped recording because early termination was requested.")
+                else:
+                    print(f"camProc finished because numFramesToRecord: {GLOBAL['numFramesToRecord'].value}")
                 sendImagesToTheWriteQueue = False
                 lastFrameID = frameNumber
                 # print(f"imageWriteQueue size: {GLOBAL['imageWriteQueue'].qsize()}")
@@ -1184,13 +1288,14 @@ def camCaptureProc(GLOBAL):  # noqa (GLOBAL shadows)
 
                 GLOBAL['guiCmdQueue'].put(['enableButtons'])
 
-                GLOBAL['guiCmdQueue'].put(
-                    ['captureReport',
-                     f"{GLOBAL['numFramesToRecord'].value + FLASH_FRAMES} images have been captured to RAM.\n\n"
-                     f"This includes {FLASH_FRAMES} frames added at the end for the terminating flash.\n\n",
-                     f"Dropped frames: {GLOBAL['framesAcquired'].value - (GLOBAL['numFramesToRecord'].value + FLASH_FRAMES)}"
-                     ]
-                )
+                if not GLOBAL['earlyTerminationRequested'].value:
+                    GLOBAL['guiCmdQueue'].put(
+                        ['captureReport',
+                         f"{GLOBAL['numFramesToRecord'].value + FLASH_FRAMES} images have been captured to RAM.\n\n"
+                         f"This includes {FLASH_FRAMES} frames added at the end for the terminating flash.\n\n",
+                         f"Dropped frames: {GLOBAL['framesAcquired'].value - (GLOBAL['numFramesToRecord'].value + FLASH_FRAMES)}"
+                         ]
+                    )
 
         while not GLOBAL['camCmdQueue'].empty():
             try:
@@ -1280,7 +1385,6 @@ def camCaptureProc(GLOBAL):  # noqa (GLOBAL shadows)
                     print('UTCstartTime', camCmdList[1])
                     UTCstartTime = camCmdList[1]
                 elif camCmd == 'setUSB3speed':
-                    # TODO Deal with auto= in all other places
                     camera.set_control_value(control_type=asi.ASI_HIGH_SPEED_MODE, value=camCmdList[1], auto=False)
                     resetFrameTimeAverage()
                 elif camCmd == 'setUSB3bandwidth':
@@ -1717,7 +1821,7 @@ def showHelpTargetFolder(event):  # noqa (event not used)
              f"FITS files. If the folder name encodes the date\n"
              f"of observation, target star, and asteroid name,\n"
              f"you can give a simple prefix, such as the asteroid name.\n\n"
-             f"Ending this string with a dash (-) is recommended.")
+             f"Ending this string with a dash (-) is recommended.\n\n")
 
 
 def showHelpParentFolder(event):  # noqa (event not used)
@@ -1728,7 +1832,7 @@ def showHelpParentFolder(event):  # noqa (event not used)
              f"Note: The parent folder must already exist.\n\n"
              f"'Target folders', which is where the sequence of\n"
              f"FITS files will be written, are nested inside this\n"
-             f"'parent folder")
+             f"'parent folder\n\n")
 
 
 def showHelpFITSfile(event):  # noqa (event not used)
@@ -1748,7 +1852,7 @@ def showHelpFITSfile(event):  # noqa (event not used)
              f"    --- <target folder n>\n\n"
              f"Note: The FITS parent folder is 'sticky' and will be used\n"
              f"the next time this app is run. So usually it will be only\n"
-             f"necessary to set/select a new target folder for the next run.")
+             f"necessary to set/select a new target folder for the next run.\n\n")
 
 
 def showHelpBlackLevelContrast(event):  # noqa (event not used)
@@ -1783,11 +1887,19 @@ def showHelpFrameCount(event):  # noqa (event not used)
              f"be filled in.\n\n"
              f"If UTC scheduling of acquisition is in use, the proper\n"
              f"frame count to use will be calculated from the Duration (secs)\n"
-             f"value and the exposure time and placed in the box")
+             f"value and the exposure time and placed in the box\n\n")
 
 def showHelpSetLedLevel(event):  # noqa (event not used)
     showInfo('Set flash LED intensity',
-             f"TBD")
+             f"It is important for getting accurate timestamps from a flashed video that\n"
+             f"the flash intensity be such that image pixels are at about half of the maximum\n"
+             f"possible intensity. (left click on the image to see what the pixel value is\n"
+             f"for the 'clicked-on' pixel). This is to avoid saturation which would make it\n"
+             f"impossible to determine correctly the intensity during the flash which\n"
+             f"would in turm invalidate the interpolation process that is needed to get\n"
+             f"accurate and precise timestamps from the flashes.\n\n"
+             f"Use the slider and the current range selector to find a good combination\n"
+             f"that achieves the desired intensity. Then save it for use during the recording.\n\n")
 
 def showHelpUTC(event):  # noqa (event not used)
     showInfo('UTC scheduling',
@@ -1810,7 +1922,7 @@ def showHelpUTC(event):  # noqa (event not used)
              f"It would be good practice to accept whenever the \n"
              f"differences are small.\n\n"
              f"If UTC start is armed (the button is yellow), clicking the button\n"
-             f"will cancel the scheduled acquisition.")
+             f"will cancel the scheduled acquisition.\n\n")
 
 
 def showHelpManualStart(event):  # noqa (event not used)
@@ -1819,26 +1931,27 @@ def showHelpManualStart(event):  # noqa (event not used)
              f"is in progress. Clicking this button now will cause\n"
              f"acquisition to start (even if a UTC timed start\n"
              f"has been specified).\n\n"
-             f"NOTE: Any FITS files present in the target folder\n"
-             f"      will be deleted !!\n\n"
+             f"NOTE: If there are any FITS files present in the target folder\n"
+             f"      you will have an opportunity to delete them.\n\n"
+             f"      It is important that there be no other FITS files in\n"
+             f"      the target folder!\n\n"
              f"If this button is green, acquisition of frames into RAM\n"
              f"is in progress. Clicking this button now will\n"
              f"terminate (early) the acquisition whether the acquisition\n"
-             f"was started manually or by UTC time.")
+             f"was started manually or by UTC time.\n\n")
 
 def showHelpVideoOnOff(event):  # noqa (event not used)
     showInfo('Video On/Off',
-             f"This is (likely) only used during development.")
+             f"This is (likely) only used during development.\n\n")
 def showHelpCameraGain(event):  # noqa (event not used)
     global cameraControlInfo
 
     max_gain = cameraControlInfo['Gain']['MaxValue']
     min_gain = cameraControlInfo['Gain']['MinValue']
-    # TODO Check the claim that gain can't be changed in video mode
     showInfo('Camera gain',
              f"Camera gain must be in the range {min_gain} to {max_gain}\n\n"
              f"NOTE: It is not possible to change gain setting while\n"
-             f"acquisition is in progress. The button is disabled.")
+             f"acquisition is in progress. The button is disabled.\n\n")
 
 
 def showHelpExposure(event):  # noqa (event not used)
@@ -1856,55 +1969,50 @@ def showHelpUSB3Speed(event):  # noqa (event not used)
     showInfo('USB3 speed',
              f"With some ZWO cameras, the USB3 system can be used at a normal speed and an enhanced speed.\n\n"
              f"For those cameras, we provide the option of using the higher speed.\n\n"
-             f"This button is disabled if the camera model in use does need/provide this option.\n")
+             f"This button is disabled if the camera model in use does need/provide this option.\n\n")
 
 def showHelpGamma(event):  # noqa
-    # TODO Check about the claim that gamma can't be changed while in video mode
     showInfo('Gamma',
              f"gamma_level controls gamma and can be set anywhere in the range 1 to 100\n\n"
-             f"A gamma_level of 50 corresponds to a gamma of 1.0\n\n"
+             f"A gamma_level of 50 corresponds to a normal gamma of 1.0\n\n"
              f"For recording an occultation of a very dim star, it can\n"
              f"be useful to set gamma_level to values less than 50. (Tests\n"
              f"have shown that this improves event detectability.)\n\n"
              f"If it is important to get better estimates of\n"
-             f"magDrop, set gamma_level to 50\n\n"
-             f"Note: it is not possible to change gamma values during\n"
-             f"acquisition. The button is disabled.\n"
-             )
+             f"magDrop, set gamma_level to 50\n\n")
 
 def showHelpSaveSettings(event):  # noqa (event not used)
     showInfo('Save camera settings',
              f"Use this button to save the current camera settings to file.\n\n"
-             f"A file name and location dialog will apear with the default directory "
-             f"preset to the current working directory (where src is executed from).\n\n"
-             f"All such files have a forced extension of .zwo_cam_set")
+             f"A file name and location dialog will apear to allow navigation to a desired\n"
+             f"directory.\n\n"
+             f"The file-name given will always have a forced extension of .zwo_cam_set\n\n")
 
 def showHelpRestoreSettings(event):  # noqa (event not used)
     showInfo('Restore camera settings',
              f"Use this button to retrieve a saved camera settings file and use those settings "
              f"to reconfigure the camera.\n\n"
              f"Only files with the extension .zwo_cam_set can be used (this is enforced when camera settings "
-             f"are saved.")
+             f"are saved.\n\n")
 def showHelpUSB3bandwidth(event):  # noqa (event not used)
     showInfo('USB3 bandwidth utilization',
-             f"Set the percentage of available USB3 bandwidth that the camera will attempt to use.")
+             f"Set the percentage of available USB3 bandwidth that the camera will attempt to use.\n\n")
 def showHelpBlackLevel(event):  # noqa (event not used)
-    # TODO Fix this help message - it's wrong for ZWO
     showInfo('Black level',
-             f"Black level can be set in the range of -5 % to +10 %\n\n"
-             f"The camera adds this value to the results of the\n"
+             f"The camera adds a value to the results of the\n"
              f"A/D conversion for each pixel and then sets any\n"
              f"results that are less than zero to zero - i.e., it clips\n"
              f"at zero. It also clips values that exceed the value\n"
              f"that corresponds to the pixel bit depth max value\n"
              f"by setting all such results to the max value.\n\n"
-             f"src defaults this value to 10% because it allows\n"
-             f"the background noise to be properly measured. While\n"
-             f"this is good for occultations, for just capturing\n"
+             f"It is important to set black level such the background noise\n"
+             f"can be properly measured for occultations. Yuse the histogram view\n"
+             f"to see the effect of Black Level settings and choose appropriately.\n\n"
+             f"While the above recommendtation is good for occultations, for just capturing\n"
              f"astronomical photos, darker backgrounds can be achieved\n"
-             f"by setting this value lower, or even negative.\n\n"
+             f"by setting this value lower.\n\n"
              f"Note: it is not possible to change black levels during\n"
-             f"acquisition. The button is disabled.")
+             f"acquisition. The button is disabled.\n\n")
 
 def showHelpSetRoi(event):  # noqa (event not used)
     showInfo('Set ROI',
@@ -1912,14 +2020,14 @@ def showHelpSetRoi(event):  # noqa (event not used)
              f"To place a centered ROI, use this format: 640 x 480\n\n"
              f"To place the ROI at an upper left corner: 800 x 640 @ 100 100\n\n"
              f"Note: the x dimension must be a multiple of 8 and the y dimension a multiple of 2\n\n"
-             f"Note: the corner position is relative to the image after binning.")
+             f"Note: the corner position is relative to the image after binning.\n\n")
 
 def showHelpSetFlashIntensity(event):  # noqa (event notused)
     showInfo('Set flash intensity',
              f"After you have selected the flash LED intensity range and positioned the intensity\n"
              f"slider until the LED brightness is at approximately 50% of saturation, click\n"
              f"this button to save those setting for use when timing flashes are\n"
-             f"added during observation recording.")
+             f"added during observation recording.\n\n")
 def showHelpSetBinsAndImageType(event):  # noqa (event not used)
     showInfo('Set bin size, image type, and ROI',
              f"The selection of bin size and image type (8 or 16 bit) must be made "
@@ -1929,7 +2037,7 @@ def showHelpSetBinsAndImageType(event):  # noqa (event not used)
              f"To place a centered ROI, use this format: 640 x 480\n\n"
              f"To place the ROI at an upper left corner: 800 x 640 @ 100 100\n\n"
              f"Note: the x dimension must be a multiple of 8 and the y dimension a multiple of 2\n\n"
-             f"Note: the corner position is relative to the image after binning.")
+             f"Note: the corner position is relative to the image after binning.\n\n")
 def showHelpFlipImage(event):  # noqa (event not used)
     showInfo('Flip image',
              f"The image coming from the camera can be flipped around the "
@@ -1937,11 +2045,13 @@ def showHelpFlipImage(event):  # noqa (event not used)
              f"(top/bottom flip), or both.\n\n"
              f"This is typically used to undo something in the "
              f"optics path that produces an unwanted image flip.\n\n"
-             f"The 'flipped' image will be written to the output files.")
+             f"The 'flipped' image will be written to the output files.\n\n")
 def showHelpShowCameraSettings(event):  # noqa (event not used)
-    # TODO Finish/expand this cryptic help
     showInfo('Show Camera Settings',
-             f"Shows current camera settings in scrollable list.")
+             f"Shows current camera settings in scrollable list.\n\n"
+             f"If the camera is performing long exposures, it may take a while\n"
+             f"for the results to appear because the setting can only be accessed\n"
+             f"between frames.\n\n")
 
 def showHelpMemoryUsage(event):  # noqa (event not used)
     showInfo('System memory usage',
@@ -1957,7 +2067,7 @@ def showHelpMemoryUsage(event):  # noqa (event not used)
              f"will be exhausted with unknown consequences.\n\n"
              f"src protects against this situation by\n"
              f"terminating frame captures if system RAM usage\n"
-             f'exceeds 90%.')
+             f'exceeds 90%.\n\n')
 
 def showHelpFileWriting(event):  # noqa (event not used)
     showInfo('Frame writing progress bar',
@@ -1969,8 +2079,7 @@ def showHelpFileWriting(event):  # noqa (event not used)
              f"written as FITS files to disk.\n\n"
              f"Because of this, take care not to close this program\n"
              f"until it reports that all files have been written.\n\n"
-             f"This progress bar will let you see what's happening.")
-
+             f"This progress bar will let you see what's happening.\n\n")
 
 def showHelpImageDisplay(event):  # noqa (event not used)
     showInfo('Image display window',
@@ -1985,30 +2094,7 @@ def showHelpImageDisplay(event):  # noqa (event not used)
              f"If the image is cropped, you can control the\n"
              f"origin coordinates with the 'Image X origin' and\n"
              f"'Image Y origin' sliders They allow one to \n"
-             f"'scroll' the image so that all regions can be examined.")
-
-
-# def showHelpRoiXoffset(event):  # noqa (event not used)
-#     showInfo('ROI X offset',
-#              f"If you select an image format (ROI) that is smaller\n"
-#              f"than the native pixel array, this smaller ROI is by default\n"
-#              f"centered on the larger native array.\n\n"
-#              f"In that case, this control allows you choose a\n"
-#              f"a different X position for the ROI.\n\n"
-#              f"If this control won't move, it's because the ROI\n"
-#              f"is equal to the native pixel array,")
-
-
-# def showHelpRoiYoffset(event):  # noqa (event not used)
-#     showInfo('ROI Y offset',
-#              f"If you select an image format (ROI) that is smaller\n"
-#              f"than the native pixel array, this smaller ROI is by default\n"
-#              f"centered on the larger native array.\n\n"
-#              f"In that case, this control allows you choose a\n"
-#              f"a different Y position for the ROI.\n\n"
-#              f"If this control won't move, it's because the ROI\n"
-#              f"is equal to the native pixel array,")
-
+             f"'scroll' the image so that all regions can be examined.\n\n")
 
 def showHelpImageXoffset(event):  # noqa (event not used)
     showInfo('Image X origin',
@@ -2017,9 +2103,8 @@ def showHelpImageXoffset(event):  # noqa (event not used)
              f"to fit. This slider controls the left edge of that crop.\n\n"
              f"If this slider won't move, it is because the image size\n"
              f"selected fits in the 960 x 720 display area.\n\n"
-             f"Note: Images written to files are never cropped."
+             f"Note: Images written to files are never cropped.\n\n"
              )
-
 
 def showHelpImageYoffset(event):  # noqa (event not used)
     showInfo('Image Y origin',
@@ -2028,7 +2113,7 @@ def showHelpImageYoffset(event):  # noqa (event not used)
              f"to fit. This slider controls the top edge of that crop.\n\n"
              f"If this slider won't move, it is because the image size\n"
              f"selected fits in the 960 x 720 display area.\n\n"
-             f"Note: Images written to files are never cropped."
+             f"Note: Images written to files are never cropped.\n\n"
              )
 
 def showHelpScrubImage(event):  # noqa (event not used)
@@ -2152,7 +2237,7 @@ def processUTCchange():
             return
 
 
-    print(cameraState['exposure'][0] / 1_000_000)  # TODO Remove this print
+    print(cameraState['exposure'][0] / 1_000_000)  # TODO Remove these print stmts
     print(type(UTCstartTime),UTCstartTime)
 
     numberOfFrames = int(duration / (cameraState['exposure'][0] / 1_000_000))
@@ -2577,8 +2662,8 @@ def askForHistogram():
     def plot(parent, data):
         global lastROIinputString
 
-        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-        from matplotlib.figure import Figure
+        # from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        # from matplotlib.figure import Figure
 
         if len(histogramStack) == 10:  # 10 is the number of histograms that will display at the same time.
             old_parent = histogramStack.pop()
@@ -2626,7 +2711,7 @@ def askForHistogram():
 
         # creating the Tkinter canvas
         # containing the Matplotlib figure
-        local_canvas = FigureCanvasTkAgg(fig, master=parent)
+        local_canvas = FigureCanvas(fig, master=parent)
         local_canvas.draw()
 
         # Place the canvas on the Tkinter window
@@ -2923,9 +3008,6 @@ def setFlashIntensity():
 
     sendLedIntensityCommandToArduino(flashOffCmdString)
 
-    # showInfo('Flash commands',
-    #          f"flash ON  command: {flashOnCmdString}\n\n"
-    #          f"flash OFF command: {flashOffCmdString}")
 def sendLedIntensityCommandToArduino(cmd=None):
     global arduinoPort
 
@@ -2938,27 +3020,40 @@ def sendLedIntensityCommandToArduino(cmd=None):
     else:
         arduinoCommand = cmd
 
-    # print(arduinoCommand)  # TODO Remove this print
+    GLOBAL['serialOutQueue'].put(arduinoCommand)
 
-    try:
-        if arduinoPort is not None:
-            try:
-                arduinoPort.write(bytes(arduinoCommand, encoding='ascii'))  # noqa (didn't like None for initial value)
-
-            except win_serial.SerialTimeoutException as e:  # noqa
-                _ = NonModalInfoDialog(
-                    gui,
-                    title=f'Arduino timeout exception:',
-                    text= f'{e}\t\t\t'
-                )
-    except Exception as e:  # noqa  (e shadows)
-        print(f'In sendLedIntensityCommandToArduino(): {e}')
-        showInfo('Arduino error',
-                 f"In sendLedIntensityCommandToArduino(): {e}")
+    # try:
+    #     if arduinoPort is not None:
+    #         try:
+    #             arduinoPort.write(bytes(arduinoCommand, encoding='ascii'))  # noqa (didn't like None for initial value)
+    #
+    #         except win_serial.SerialTimeoutException as e:  # noqa
+    #             _ = NonModalInfoDialog(
+    #                 gui,
+    #                 title=f'Arduino timeout exception:',
+    #                 text= f'{e}\t\t\t'
+    #             )
+    # except Exception as e:  # noqa  (e shadows)
+    #     print(f'In sendLedIntensityCommandToArduino(): {e}')
+    #     showInfo('Arduino error',
+    #              f"In sendLedIntensityCommandToArduino(): {e}")
 
 
 def processStartButtonClick():
-    global flashOnCmdString
+    global flashOnCmdString, currentFrameNum
+
+    if GLOBAL['waitForRestart'].value:
+        initalizeForNewRecording()
+
+    if GLOBAL['fileWritingInProgress'].value:
+        # We're being asked to stop acquisition
+        GLOBAL['earlyTerminationRequested'].value = True
+        print("Early termination request posted")
+
+        startButton.config(bg='red', text='Start acquisition')
+        return
+
+
 
     if fitsFolderPath == "":
         showInfo('Error !!!',
@@ -2973,39 +3068,6 @@ def processStartButtonClick():
         return
 
     try:
-        if not cameraState['videoOn']:
-            GLOBAL['fileWritingInProgress'].value = False
-            GLOBAL['numFramesWritten'].value = 0
-            currentFrameNum = 0
-            if frameCount.get() == '':
-                showInfo('Setup error',
-                         f"\nThe number of frames to capture has not been set.\n\n\n\n")
-                return
-            GLOBAL['numFramesToRecord'].value = int(frameCount.get())  # noqa
-
-            GLOBAL['camCmdQueue'].put(['startVideo'])
-            cameraState['videoOn'] = True
-            while not GLOBAL['cameraIsRunning'].value:
-                pixelValueLabel.configure(text='Waiting for video to turn on')  # noqa
-            pixelValueLabel.configure(text='Video turned on')  # noqa
-            GLOBAL['camCmdQueue'].put(['startRecording'])
-
-        else:
-            GLOBAL['numFramesToRecord'].value = int(frameCount.get())  # noqa
-            currentFrameNum = GLOBAL['numFramesWritten'].value
-            GLOBAL['camCmdQueue'].put(['startRecording'])
-
-
-        if currentFrameNum > 0:
-            # We're being asked to stop acquisition
-            GLOBAL['numFramesWritten'].value = 0
-            GLOBAL['fileWritingInProgress'].value = True
-            # Set new upper limit so that file write progress bar works properly
-            GLOBAL['numFramesToRecord'].value = currentFrameNum + 1
-
-            startButton.config(bg='red', text='Start acquisition')
-            return
-
         # We're about to start frame acquisition. But first we check for any fits files
         # that are already present.
 
@@ -3013,7 +3075,7 @@ def processStartButtonClick():
         numFitsFilesFound = len(fitsFilesFound)
         if numFitsFilesFound > 0:
             msg = (f"{numFitsFilesFound} FITS files are already present in the target folder.\n\n"
-                   f"Do you wish to delete them?")
+                   f"Do you wish to delete them?\n")
             answer = tk.messagebox.askyesno('Confirmation required', msg)
             if answer:  # User requests deletion of the fits files
                 for fname in fitsFilesFound:
@@ -3022,13 +3084,29 @@ def processStartButtonClick():
                 # Return without triggering acquisition start
                 return
 
+        if not cameraState['videoOn']:
+            currentFrameNum = 0
+            if frameCount.get() == '':
+                showInfo('Setup error',
+                         f"\nThe number of frames to capture has not been set.\n\n\n\n")
+                return
+            GLOBAL['numFramesToRecord'].value = int(frameCount.get())  # noqa
+            GLOBAL['camCmdQueue'].put(['startVideo'])
+            cameraState['videoOn'] = True
+            while not GLOBAL['cameraIsRunning'].value:
+                pixelValueLabel.configure(text='Waiting for video to turn on')  # noqa
+            pixelValueLabel.configure(text='Video turned on')  # noqa
+        else:
+            GLOBAL['numFramesToRecord'].value = int(frameCount.get())  # noqa
+            currentFrameNum = 0
+
         # We're about to manually start acquisition. Clear UTC start first.
         GLOBAL['UTCstartArmed'].value = False
         setUtcButton.config(text='Arm UTC start', bg='lightgray')
 
         GLOBAL['numFramesWritten'].value = 0
         GLOBAL['fileWritingInProgress'].value = True  # This the indicator that a manual start has been done
-
+        GLOBAL['camCmdQueue'].put(['startRecording'])
 
         startButton.config(bg='green', text="Stop acquisition")
 
@@ -3078,18 +3156,6 @@ def displayThread():
                 continue
 
 
-            # imageType = cameraState['imageType']
-            # if imageType == UINT8:
-            #     numBytes = 1
-            # elif imageType == RAW16:
-            #     numBytes = 2
-            # else:
-            #     showInfo(title='Camera state error', msg=f'Invalid imageType found: {imageType}')
-
-            # timeStamp = f"timestamp: {imageToDisplay[2]['Serial Data:']}"
-
-            # For debug - we add Frame ID to timestamp
-            # timeStamp = imageToDisplay[2]['Serial Data:'] + "  " + imageToDisplay[2]['Frame ID:']
 
             # try:
             #     if not doNotAskForTimeCorrectionAgain:
@@ -3442,6 +3508,18 @@ def run():
     guiCmdThread = threading.Thread(target=guiCmdHandler)
     guiCmdThread.daemon = True  # Needed so that thread stops when program exits
     guiCmdThread.start()
+
+    serialInputThread = threading.Thread(target=serialRcvThread)
+    serialInputThread.daemon = True  # Needed so that thread stops when program exits
+    serialInputThread.start()
+
+    serialOutputThread = threading.Thread(target=serialOutThread)
+    serialOutputThread.daemon = True  # Needed so that thread stops when program exits
+    serialOutputThread.start()
+
+    testSerialIoThread = threading.Thread(target=testSerialIO)
+    testSerialIoThread.daemon = True
+    testSerialIoThread.start()
 
     try:
         # Run the GUI
