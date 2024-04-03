@@ -4,7 +4,7 @@
 #     A threaded single camera system with a tkinter GUI using
 #     a separate core for image capture into RAM
 #
-#     Incorporates control of the IOTAflasherpip instal
+#     Incorporates control of the IOTA-GFT flasher
 #
 # =============================================================================
 
@@ -12,6 +12,8 @@ __version__ = "1.0.1"
 
 import gc
 import glob
+
+# import subprocess
 
 # import serial
 import serial.tools.list_ports as port_list
@@ -279,7 +281,6 @@ currentFrameNum = 0
 
 histogramStack = []
 
-# arduinoPort = serial.Serial()
 arduinoPort = None
 
 frameNumber = 0
@@ -365,6 +366,7 @@ setExposureButton: tk.Button
 setGammaButton: tk.Button
 setUSB3SpeedButton: tk.Button
 showCameraSettingsButton: tk.Button
+toggleLedOnOffButton: tk.Button
 scrubCheckbox: tk.Checkbutton
 ledCurrentSelectorLabel: tk.simpledialog
 ledCurrentSelector: tk.OptionMenu
@@ -387,6 +389,7 @@ imageXoffset: tk.IntVar
 imageYoffset: tk.IntVar
 zoomLevel: tk.StringVar
 ledIntensityRange: tk.StringVar
+ledOn = False
 ledIntensity: tk.IntVar
 highCheckBox: tk.IntVar
 midCheckBox: tk.IntVar
@@ -515,8 +518,8 @@ def writeFilesThread():
             # end required elements
 
             ts_str = imageList[5].strftime('%Y-%m-%dT%H:%M:%S.%f')
-            outhdr['CPU-OBS'] = ts_str
-            outhdr.comments['CPU-OBS'] =  'System Clock:Est. Frame Start'
+            outhdr['DATE-OBS'] = ts_str
+            outhdr.comments['DATE-OBS'] =  'System Clock:Est. Frame Start'  # This matches SharpCap practice
             outhdr['SWCREAT1'] = __version__
 
             outhdr['INSTRUME'] = cameraState['cameraName']
@@ -525,7 +528,7 @@ def writeFilesThread():
             fps = 1.0 / (averageFrameTime / 1000.0)
             outhdr['COMMENT'] = f"avg frame rate: {fps:0.2f} fps"
             # outhdr['COMMENT'] = f"flashLevel: {np.sum(image)}"
-            flashLightCurve.append(np.sum(image))
+            flashLightCurve.append(np.sum(image.astype('int64')))
             # print(f"frame {frame:04d}  flashLevel: {np.sum(image)}")
 
             outhdr['COMMENT'] = f"gain: {cameraState['gain'][0]}"
@@ -752,7 +755,7 @@ def processFlashLightCurve(ts1='2023-11-11 16:29:20+00:00', ts2='2023-11-11 16:2
     fitsFiles = glob.glob(f'{fitsFolderPath}/*.fits')
     print(f"Num fits files found: {len(fitsFiles)}  last was: {fitsFiles[-1]}")
 
-    # Now we sort them. This not needed fo src, but may be important for the planned utility.
+    # Now we sort them. This is not needed for this code, but may be important for the planned utility.
     # In any case, it doesn't hurt.
     fitsFiles.sort()
 
@@ -763,14 +766,16 @@ def processFlashLightCurve(ts1='2023-11-11 16:29:20+00:00', ts2='2023-11-11 16:2
     i = 0
     for frame_file in fitsFiles:
         with fits.open(frame_file, mode='update') as hdul:
-            hdr = hdul[0].header
-            hdr['DATE-OBS'] = timestamps[i]
-            hdr.comments['DATE-OBS'] = 'GPS: IotaFlasher v1.0'
             try:
-                cpu_timestamp = hdr['CPU-OBS']
-                cpu_timestamps.append(cpu_timestamp)
+                if hdr.comments['DATE-OBS'].startswith('System'):
+                    cpu_timestamp = hdr['DATE-OBS']
+                    cpu_timestamps.append(cpu_timestamp)
             except KeyError:
                 pass
+            hdr = hdul[0].header
+            hdr['DATE-OBS'] = timestamps[i]
+            hdr.comments['DATE-OBS'] = 'GPS: IotaFlasher'
+
             i += 1
 
     print(f"Number of CPU-OBS timestamps found: {len(cpu_timestamps)}")
@@ -933,12 +938,9 @@ def connectToArduino(port):
     try:
         arduinoPort = win_serial.Serial(
             port,
-            baudrate=115200,
-            # bytesize=serial.serialutil.EIGHTBITS,
+            baudrate=250000,
             bytesize=8,
-            # parity=serial.serialutil.PARITY_NONE,
             parity='N',
-            # stopbits=serial.serialutil.STOPBITS_ONE,
             stopbits=1,
             rtscts=True,
             write_timeout=0  # seconds
@@ -959,7 +961,7 @@ def connectToArduino(port):
 
 def testSerialIO():
 
-    msg_num = 0
+    # msg_num = 0
     time.sleep(4)  # Give enough time for the serialRcvThread() to detect arduinoPort
 
     while True:
@@ -981,6 +983,7 @@ def serialOutThread():
         try:
             str_to_send = GLOBAL['serialOutQueue'].get()
             arduinoPort.write(bytes(str_to_send, encoding='ascii'))  # noqa (didn't like None for initial value)
+            print(f"\nSerialOut: {str_to_send}")
         except (BrokenPipeError, EOFError, OSError):  # These exceptions are thrown during shutdown - we ignore them
             pass
 
@@ -996,6 +999,8 @@ def serialRcvThread():
         if arduinoPort.in_waiting > 0:       # noqa
             buffer = arduinoPort.readline()  # noqa
             rcvd_str = buffer.decode('ascii')
+            if rcvd_str.startswith('[ERROR'):
+                showInfo("Error !!!", rcvd_str)
             print(f"SerialIn: {rcvd_str[:-1]}")
 
 def guiCmdHandler():
@@ -1013,9 +1018,9 @@ def guiCmdHandler():
                 print(f'camera found: {msg_arrival_time - msg_sent_time} ns')
             askCameraSettings(show_settings=False)
         elif cmd[0] == 'flashON':
-            sendLedIntensityCommandToArduino(flashOnCmdString)
+            sendLedCommandToArduino(flashOnCmdString)
         elif cmd[0] == 'flashOFF':
-            sendLedIntensityCommandToArduino(flashOffCmdString)
+            sendLedCommandToArduino(flashOffCmdString)
         elif cmd[0] == 'ArduinoComPort':
             port = cmd[1]
             # showInfo(title='Arduino connection status', msg=f'Arduino is connected to port {port}')
@@ -1428,6 +1433,7 @@ def guiInit():
     global showCameraSettingsButton, gainEntry, scrubCheckbox
     global canvasFrame, pixelValueLabel, ledIntensity, ledIntensityRange
     global ledCurrentSelector, ledCurrentSelectorLabel, ledIntensityScale, cameraControlInfo
+    global toggleLedOnOffButton
 
     titleMsg = f"{VERSION}"  # This initial title will be updated once camera name info is available
 
@@ -1709,6 +1715,12 @@ def guiInit():
     setFlashIntensityButton.grid(column=0, row=rowToUse, columnspan=1, sticky=tk.N + tk.E + tk.W, padx=(2, 2))
     setFlashIntensityButton.bind('<Button-3>', showHelpSetFlashIntensity)
 
+    toggleLedOnOffButton = tk.Button(
+        gui, command=processLedOnOff,
+        text='Turn LED On', default='active', bg='lightgray'
+    )
+    toggleLedOnOffButton.grid(column=1, row=rowToUse, columnspan=1, sticky=tk.N + tk.E + tk.W, padx=(2, 2))
+
     rowToUse += 1
     separator6 = tk.Frame(gui, bd=10, relief='raised', height=4, bg='black')
     separator6.grid(column=0, columnspan=2, row=rowToUse, sticky='ew', padx=(4, 2))
@@ -1764,6 +1776,18 @@ def guiInit():
 
 
     gui.update()  # update TCL tasks to make window appear
+
+def processLedOnOff():
+    global ledOn, toggleLedOnOffButton
+
+    if not ledOn:
+        ledOn = True
+        sendLedCommandToArduino('ON')
+        toggleLedOnOffButton.config(bg='red', text="Turn LED Off")
+    else:
+        sendLedCommandToArduino('OFF')
+        toggleLedOnOffButton.config(bg='lightgray', text="Turn LED On")
+        ledOn = False
 
 def disableLEDintensityControls():
     global ledCurrentSelector, ledCurrentSelectorLabel, ledIntensityScale
@@ -2965,26 +2989,46 @@ def showInfo(title, msg, non_modal=True):
     else:
         messageBox.showinfo(title, msg)
 
+def checksum(cmd):
+    chk = 0
+    for char in cmd:
+        chk ^= ord(char)
+    return f'*{chk:02x}'
+
 def formCommandToSendForLedIntensityChange(brightness=None):
+
     if brightness is None:
         intensity = ledIntensity.get()
     else:
         intensity = brightness
 
     if ledIntensityRange.get().startswith('H'):
-        return f'setLED( high, {intensity})\n'
+        cmd1 = f'flash range 2'
+        cmd1 += checksum(cmd1) + '\r\n'
+        cmd2 = f'flash level {intensity}'
+        cmd2 += checksum(cmd2) + '\r\n'
+        return cmd1 + cmd2
 
     if ledIntensityRange.get().startswith('M'):
-        return f'setLED( mid, {intensity})\n'
+        cmd1 = f'flash range 1'
+        cmd1 += checksum(cmd1) + '\r\n'
+        cmd2 = f'flash level {intensity}'
+        cmd2 += checksum(cmd2) + '\r\n'
+        return cmd1 + cmd2
 
     if ledIntensityRange.get().startswith('L'):
-        return f'setLED( low, {intensity})\n'
+        cmd1 = f'flash range 0'
+        cmd1 += checksum(cmd1) + '\r\n'
+        cmd2 = f'flash level {intensity}'
+        cmd2 += checksum(cmd2) + '\r\n'
+        return cmd1 + cmd2
 
     showInfo('Error',
              f"An unexpected value of {ledIntensityRange.get()} as LED intensity range was found.")
 
 def processLedRangeChange(value):  # noqa (value not used)
-    sendLedIntensityCommandToArduino()
+    sendLedCommandToArduino()
+
 def processLedIntensityChange(value):  # noqa (value not used)
     global lastLedIntensity, arduinoPort
 
@@ -2996,7 +3040,7 @@ def processLedIntensityChange(value):  # noqa (value not used)
     # else:
     #     lastLedIntensity = value
 
-    sendLedIntensityCommandToArduino()
+    sendLedCommandToArduino()
 
 def setFlashIntensity():
     global flashOffCmdString, flashOnCmdString
@@ -3006,38 +3050,23 @@ def setFlashIntensity():
 
     ledIntensity.set(0)
 
-    sendLedIntensityCommandToArduino(flashOffCmdString)
+    sendLedCommandToArduino(flashOffCmdString)
 
-def sendLedIntensityCommandToArduino(cmd=None):
+def sendLedCommandToArduino(cmd=None):
     global arduinoPort
 
     if cmd is None:
         arduinoCommand = formCommandToSendForLedIntensityChange()
     elif cmd == 'ON':
-        arduinoCommand = flashOnCmdString
+        ledCmd = 'led on'
+        arduinoCommand = ledCmd + checksum(ledCmd) + '\r\n'
     elif cmd == 'OFF':
-        arduinoCommand = flashOffCmdString
+        ledCmd = 'led off'
+        arduinoCommand = ledCmd + checksum(ledCmd) + '\r\n'
     else:
         arduinoCommand = cmd
 
     GLOBAL['serialOutQueue'].put(arduinoCommand)
-
-    # try:
-    #     if arduinoPort is not None:
-    #         try:
-    #             arduinoPort.write(bytes(arduinoCommand, encoding='ascii'))  # noqa (didn't like None for initial value)
-    #
-    #         except win_serial.SerialTimeoutException as e:  # noqa
-    #             _ = NonModalInfoDialog(
-    #                 gui,
-    #                 title=f'Arduino timeout exception:',
-    #                 text= f'{e}\t\t\t'
-    #             )
-    # except Exception as e:  # noqa  (e shadows)
-    #     print(f'In sendLedIntensityCommandToArduino(): {e}')
-    #     showInfo('Arduino error',
-    #              f"In sendLedIntensityCommandToArduino(): {e}")
-
 
 def processStartButtonClick():
     global flashOnCmdString, currentFrameNum
@@ -3154,8 +3183,6 @@ def displayThread():
             if not got_an_image:
                 time.sleep(0.1)
                 continue
-
-
 
             # try:
             #     if not doNotAskForTimeCorrectionAgain:
@@ -3425,10 +3452,10 @@ def on_close():
         gui.quit()  # This causes mainloop() to exit
 
     except Exception as e1:
-        print(f'!!!!! While tryng to quit gui got: {e1} !!!!!')
+        print(f'!!!!! While trying to quit gui got: {e1} !!!!!')
 
     # Write the initialization dictionary (holds things that are to be sticky)
-    pickle.dump(iniDict, open('PyZwoCapture.ini.p', 'wb'))
+    pickle.dump(iniDict, open('../PyZwoCapture/PyZwoCapture.ini.p', 'wb'))
 
 
 def getTkWindow():
@@ -3488,7 +3515,7 @@ def run():
     # For a new installation, there will be no src.ini.p file, so we test for that.
     # src.ini.p is created the first time the app is closed
     try:
-        iniDict = pickle.load(open('PyZwoCapture.ini.p', 'rb'))
+        iniDict = pickle.load(open('../../dist/PyZwoCapture-1.0.1-py3-none-any - Copy/PyZwoCapture/PyZwoCapture.ini.p', 'rb'))
     except FileNotFoundError:
         pass
 

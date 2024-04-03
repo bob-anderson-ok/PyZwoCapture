@@ -19,3 +19,6 @@
     description = "For ZWO ASI cameras: controls, captures, and runs the IOTAflash module"
     authors = [ {name = "Robert L Anderson, Jr", email = "bob.anderson.ok@gmail.com"} ]
     readme = "README.rst"
+    dependencies = [
+        "PyFlashToGPS", "pyubx2"
+    ]
